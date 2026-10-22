@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""WoW 拍賣場價格波動提醒 bot（台服商品／commodities）。
+"""WoW 拍賣場價格波動提醒 bot（台服商品／commodities），資料來自 Undermine Exchange API。
 
-資料來源和 undermine.exchange 相同：Blizzard 官方 Battle.net API。
 布料、草藥、礦石這類「商品」是全區共用的拍賣場，所以 tw-whisperwind
 看到的布料價格，其實就是整個台服區的商品價格。
 
@@ -14,7 +13,7 @@
 from __future__ import annotations
 
 import argparse
-import base64
+import gzip
 import json
 import os
 import sqlite3
@@ -23,26 +22,31 @@ import sys
 import time
 import tomllib
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-USER_AGENT = "wow-ah-alert/1.0"
+USER_AGENT = "wow-ah-alert/2.0"
+API_BASE = "https://api.undermine.exchange"
+# 網站前端用的靜態物品資料（API 本身不提供物品名稱和分類）
+SITE_JSON = "https://undermine.exchange/json/mainline"
+LOCALES = {"zh_TW": "zhtw", "en_US": "enus", "ko_KR": "kokr", "de_DE": "dede", "fr_FR": "frfr"}
+METADATA_MAX_AGE = 7 * 86400
 
 
 # ---------------------------------------------------------------- 設定
 
 @dataclass
 class Config:
-    client_id: str
-    client_secret: str
+    api_key: str
     region: str
     realm_slug: str
     locale: str
     item_class: int | None
     item_subclass: int | None
+    min_expansion: int | None
     item_ids: list[int]
     buy_quantity: int
     poll_minutes: int
@@ -61,20 +65,20 @@ class Config:
 def load_config(path: Path) -> Config:
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    bnet = raw.get("battlenet", {})
+    um = raw.get("undermine", {})
     watch = raw.get("watch", {})
     alert = raw.get("alert", {})
     notify = raw.get("notify", {})
     targets = {int(t["item_id"]): t for t in raw.get("target", [])}
     return Config(
         # 環境變數優先，避免把金鑰寫進檔案
-        client_id=os.environ.get("BNET_CLIENT_ID", bnet.get("client_id", "")),
-        client_secret=os.environ.get("BNET_CLIENT_SECRET", bnet.get("client_secret", "")),
-        region=bnet.get("region", "tw"),
-        realm_slug=bnet.get("realm_slug", "whisperwind"),
-        locale=bnet.get("locale", "zh_TW"),
+        api_key=os.environ.get("UNDERMINE_API_KEY", um.get("api_key", "")),
+        region=um.get("region", "tw"),
+        realm_slug=um.get("realm_slug", "whisperwind"),
+        locale=um.get("locale", "zh_TW"),
         item_class=watch.get("item_class"),
         item_subclass=watch.get("item_subclass"),
+        min_expansion=watch.get("min_expansion"),
         item_ids=[int(i) for i in watch.get("item_ids", [])] + list(targets),
         buy_quantity=int(watch.get("buy_quantity", 20)),
         poll_minutes=int(watch.get("poll_minutes", 10)),
@@ -94,87 +98,69 @@ def load_config(path: Path) -> Config:
 # ---------------------------------------------------------------- HTTP
 
 def http(url: str, *, data: bytes | None = None, headers: dict | None = None,
-         timeout: int = 120) -> tuple[int, dict, bytes]:
+         timeout: int = 60) -> tuple[int, bytes]:
     req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, dict(resp.headers), resp.read()
+            status, body, encoding = resp.status, resp.read(), resp.headers.get("Content-Encoding")
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read()
+        status, body, encoding = e.code, e.read(), e.headers.get("Content-Encoding")
+    if encoding == "gzip":
+        body = gzip.decompress(body)
+    return status, body
 
 
-class Blizzard:
+def get_json(url: str, headers: dict | None = None):
+    status, body = http(url, headers={"Accept-Encoding": "gzip", **(headers or {})})
+    if status != 200:
+        raise RuntimeError(f"{url} 回應 {status}: {body[:200]!r}")
+    return json.loads(body)
+
+
+def parse_ts(iso: str) -> int:
+    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+
+
+class Undermine:
+    """Undermine Exchange API。每小時有 3000 點額度，商品相關的呼叫每次 1～3 點。"""
+
     def __init__(self, cfg: Config):
-        if not cfg.client_id or not cfg.client_secret:
-            sys.exit("缺少 Battle.net client_id / client_secret（到 https://develop.battle.net 申請）")
+        if not cfg.api_key:
+            sys.exit("缺少 Undermine API key（用 Patreon 登入 https://undermine.exchange/api.html 後取得）")
         self.cfg = cfg
-        self.base = f"https://{cfg.region}.api.blizzard.com"
-        self._token = ""
-        self._token_expires = 0.0
+        self.headers = {"Authorization": f"ApiKey {cfg.api_key}"}
 
-    def token(self) -> str:
-        if time.time() < self._token_expires - 60:
-            return self._token
-        basic = base64.b64encode(f"{self.cfg.client_id}:{self.cfg.client_secret}".encode()).decode()
-        status, _, body = http(
-            "https://oauth.battle.net/token",
-            data=b"grant_type=client_credentials",
-            headers={"Authorization": f"Basic {basic}",
-                     "Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if status != 200:
-            raise RuntimeError(f"取得 token 失敗 ({status}): {body[:200]!r}")
-        payload = json.loads(body)
-        self._token = payload["access_token"]
-        self._token_expires = time.time() + payload.get("expires_in", 3600)
-        return self._token
+    def _get(self, path: str):
+        return get_json(f"{API_BASE}{path}", self.headers)["result"]
 
-    def get(self, path: str, params: dict, extra_headers: dict | None = None) -> tuple[int, dict, bytes]:
-        url = f"{self.base}{path}?{urllib.parse.urlencode(params)}"
-        headers = {"Authorization": f"Bearer {self.token()}", "Accept-Encoding": "identity"}
-        return http(url, headers={**headers, **(extra_headers or {})})
+    def commodities(self) -> tuple[int, dict[int, dict]]:
+        """全區商品摘要（3 點）。回傳 (Blizzard 快照時間, {item_id: {price, quantity}})。"""
+        r = self._get(f"/v1/region/{self.cfg.region}/commodities.json")
+        return parse_ts(r["snapshot"]), {int(k): v for k, v in r["commodities"].items()}
 
-    def commodities(self, if_modified_since: str = "") -> tuple[str, list[dict]] | None:
-        """回傳 (Last-Modified, auctions)；資料沒更新時回傳 None。"""
-        headers = {"If-Modified-Since": if_modified_since} if if_modified_since else {}
-        status, resp_headers, body = self.get(
-            "/data/wow/auctions/commodities",
-            {"namespace": f"dynamic-{self.cfg.region}", "locale": self.cfg.locale},
-            headers,
-        )
-        if status == 304:
-            return None
-        if status != 200:
-            raise RuntimeError(f"讀取商品拍賣失敗 ({status}): {body[:200]!r}")
-        return resp_headers.get("Last-Modified", ""), json.loads(body)["auctions"]
+    def auctions(self, item_id: int) -> list[dict]:
+        """單一商品目前的所有掛單（1 點）。"""
+        return self._get(f"/v1/region/{self.cfg.region}/commodities/{item_id}/now.json").get("auctions", [])
 
-    def search_items(self, item_class: int, item_subclass: int | None) -> dict[int, str]:
-        """用物品搜尋 API 找出某分類的所有物品 id 和名稱。"""
-        result: dict[int, str] = {}
-        page = 1
-        while True:
-            params = {"namespace": f"static-{self.cfg.region}", "item_class.id": item_class,
-                      "orderby": "id", "_pageSize": 1000, "_page": page}
-            if item_subclass is not None:
-                params["item_subclass.id"] = item_subclass
-            status, _, body = self.get("/data/wow/search/item", params)
-            if status != 200:
-                raise RuntimeError(f"物品搜尋失敗 ({status}): {body[:200]!r}")
-            payload = json.loads(body)
-            for r in payload.get("results", []):
-                d = r["data"]
-                name = d.get("name", {})
-                result[d["id"]] = name.get(self.cfg.locale) or name.get("en_US") or str(d["id"])
-            if page >= payload.get("pageCount", 1):
-                return result
-            page += 1
+    def hourly(self, item_id: int) -> list[dict]:
+        """單一商品過去約 14 天的每小時價格（3 點）。"""
+        return self._get(f"/v1/region/{self.cfg.region}/commodities/{item_id}/hourly.json").get("hourly", [])
 
-    def item_name(self, item_id: int) -> str:
-        status, _, body = self.get(f"/data/wow/item/{item_id}",
-                                   {"namespace": f"static-{self.cfg.region}", "locale": self.cfg.locale})
-        if status != 200:
-            return str(item_id)
-        return json.loads(body).get("name") or str(item_id)
+
+def fetch_item_metadata(locale: str) -> dict[int, dict]:
+    """從網站前端的靜態資料取得物品分類、資料片和名稱。"""
+    items = get_json(f"{SITE_JSON}/items.unbound.json")
+    names = get_json(f"{SITE_JSON}/names.unbound.{LOCALES.get(locale, 'enus')}.json")
+    qualities = get_json(f"{SITE_JSON}/craftingQualities.json")
+    out = {}
+    for k, v in items.items():
+        name = names.get(k, k)
+        tier = qualities.get(str(v.get("craftingQualityId")), {}).get("tier")
+        if tier:
+            name = f"{name} ★{tier}"
+        out[int(k)] = {"class": v.get("class"), "subclass": v.get("subclass"),
+                       "expansion": v.get("expansion", 0), "name": name}
+    return out
 
 
 # ---------------------------------------------------------------- 價格計算
@@ -182,30 +168,21 @@ class Blizzard:
 @dataclass
 class Price:
     item_id: int
-    min_price: int      # 最便宜一單位（銅）
+    min_price: int      # 最便宜一單位（銅），和網站上顯示的價格相同
     buy_price: int      # 買 buy_quantity 個的平均單價（銅），比最低價不容易被單筆掛單影響
     quantity: int       # 拍賣場總數量
 
 
-def summarize(auctions: list[dict], item_ids: set[int], buy_quantity: int) -> dict[int, Price]:
-    listings: dict[int, list[tuple[int, int]]] = {}
-    for a in auctions:
-        iid = a["item"]["id"]
-        if iid in item_ids:
-            listings.setdefault(iid, []).append((a["unit_price"], a["quantity"]))
-    out = {}
-    for iid, rows in listings.items():
-        rows.sort()
-        need, cost = buy_quantity, 0
-        for price, qty in rows:
-            take = min(need, qty)
-            cost += take * price
-            need -= take
-            if need == 0:
-                break
-        bought = buy_quantity - need
-        out[iid] = Price(iid, rows[0][0], round(cost / bought), sum(q for _, q in rows))
-    return out
+def buy_price(auctions: list[dict], buy_quantity: int) -> int | None:
+    need, cost = buy_quantity, 0
+    for a in sorted(auctions, key=lambda a: a["price"]):
+        take = min(need, a.get("quantity", 1))
+        cost += take * a["price"]
+        need -= take
+        if need == 0:
+            break
+    bought = buy_quantity - need
+    return round(cost / bought) if bought else None
 
 
 def fmt_gold(copper: float) -> str:
@@ -242,9 +219,13 @@ class Store:
     def names(self) -> dict[int, str]:
         return dict(self.db.execute("SELECT item_id, name FROM item"))
 
-    def save_names(self, names: dict[int, str]) -> None:
-        self.db.executemany("INSERT OR REPLACE INTO item VALUES (?, ?)", names.items())
+    def replace_names(self, names: dict[int, str]) -> None:
+        self.db.execute("DELETE FROM item")
+        self.db.executemany("INSERT INTO item VALUES (?, ?)", names.items())
         self.db.commit()
+
+    def has_history(self, item_id: int) -> bool:
+        return self.db.execute("SELECT 1 FROM snapshot WHERE item_id=? LIMIT 1", (item_id,)).fetchone() is not None
 
     def last(self, item_id: int, before_ts: int) -> tuple[int, int] | None:
         return self.db.execute(
@@ -333,14 +314,14 @@ def notify(cfg: Config, text: str) -> None:
     if cfg.discord_webhook:
         # Discord 單則訊息上限 2000 字
         for chunk in split(text, 1900):
-            status, _, body = http(cfg.discord_webhook, data=json.dumps({"content": chunk}).encode(),
-                                   headers={"Content-Type": "application/json"})
+            status, body = http(cfg.discord_webhook, data=json.dumps({"content": chunk}).encode(),
+                                headers={"Content-Type": "application/json"})
             if status >= 300:
                 print(f"Discord 傳送失敗 ({status}): {body[:200]!r}", file=sys.stderr)
         sent = True
     if cfg.telegram_token and cfg.telegram_chat_id:
         for chunk in split(text.replace("**", ""), 4000):
-            status, _, body = http(
+            status, body = http(
                 f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage",
                 data=json.dumps({"chat_id": cfg.telegram_chat_id, "text": chunk,
                                  "disable_web_page_preview": True}).encode(),
@@ -364,38 +345,66 @@ def split(text: str, size: int) -> list[str]:
 
 # ---------------------------------------------------------------- 主流程
 
-def tracked_items(cfg: Config, api: Blizzard, store: Store) -> dict[int, str]:
+def tracked_items(cfg: Config, store: Store, commodities: dict[int, dict]) -> dict[int, str]:
+    """決定要追蹤哪些物品。物品資料每 7 天重新下載一次。"""
+    key = f"items:{cfg.item_class}.{cfg.item_subclass}:{cfg.min_expansion}:{cfg.locale}:{sorted(cfg.item_ids)}"
     names = store.names()
-    key = f"category:{cfg.item_class}.{cfg.item_subclass}"
-    if cfg.item_class is not None and store.meta(key) != "done":
-        print(f"第一次執行：搜尋分類 {cfg.item_class}.{cfg.item_subclass} 的物品…")
-        found = api.search_items(cfg.item_class, cfg.item_subclass)
-        store.save_names(found)
-        store.set_meta(key, "done")
-        names.update(found)
-    missing = [i for i in cfg.item_ids if i not in names]
-    if missing:
-        fetched = {i: api.item_name(i) for i in missing}
-        store.save_names(fetched)
-        names.update(fetched)
-    if cfg.item_class is None:
-        return {i: names[i] for i in cfg.item_ids}
+    if names and store.meta("items_key") == key and \
+            time.time() - float(store.meta("items_fetched", "0")) < METADATA_MAX_AGE:
+        return names
+
+    meta = fetch_item_metadata(cfg.locale)
+    chosen = set(cfg.item_ids)
+    if cfg.item_class is not None:
+        in_cat = [i for i, m in meta.items() if i in commodities and m["class"] == cfg.item_class
+                  and (cfg.item_subclass is None or m["subclass"] == cfg.item_subclass)]
+        # 沒指定資料片時，預設只追最新資料片的物品（舊材料通常沒人在乎）
+        min_exp = cfg.min_expansion
+        if min_exp is None and in_cat:
+            min_exp = max(meta[i]["expansion"] for i in in_cat)
+        chosen |= {i for i in in_cat if meta[i]["expansion"] >= (min_exp or 0)}
+    names = {i: meta[i]["name"] if i in meta else str(i) for i in chosen}
+    store.replace_names(names)
+    store.set_meta("items_key", key)
+    store.set_meta("items_fetched", str(time.time()))
+    print(f"追蹤 {len(names)} 項物品：{'、'.join(sorted(set(names.values())))}")
     return names
 
 
-def run_once(cfg: Config, api: Blizzard, store: Store) -> bool:
-    """檢查一次。有新資料時回傳 True。"""
-    result = api.commodities(store.meta("last_modified"))
-    if result is None:
+def seed_history(api: Undermine, store: Store, item_id: int) -> None:
+    """新追蹤的物品先抓過去 14 天的每小時價格，讓「比中位數」的提醒馬上可以用。
+    歷史資料只有最低價，所以先拿最低價當作均價。"""
+    rows = {}
+    for h in api.hourly(item_id):
+        if h.get("price"):
+            ts = parse_ts(h["snapshot"])
+            rows[ts] = Price(item_id, h["price"], h["price"], h.get("quantity", 0))
+    for ts, p in rows.items():
+        store.save(ts, {item_id: p})
+
+
+def run_once(cfg: Config, api: Undermine, store: Store) -> bool:
+    """檢查一次。有新快照時回傳 True。"""
+    ts, commodities = api.commodities()
+    if str(ts) == store.meta("last_snapshot"):
         return False
-    last_modified, auctions = result
-    names = tracked_items(cfg, api, store)
-    prices = summarize(auctions, set(names), cfg.buy_quantity)
-    ts = int(time.time())
+    names = tracked_items(cfg, store, commodities)
+
+    prices = {}
+    for iid in names:
+        c = commodities.get(iid)
+        if not c or not c.get("quantity"):
+            continue
+        if not store.has_history(iid):
+            seed_history(api, store, iid)
+        bp = buy_price(api.auctions(iid), cfg.buy_quantity) if cfg.buy_quantity > 1 else None
+        prices[iid] = Price(iid, c["price"], bp or c["price"], c["quantity"])
+
     messages = check_alerts(cfg, store, ts, prices, names)
     store.save(ts, prices)
-    store.set_meta("last_modified", last_modified)
-    print(f"[{time.strftime('%Y-%m-%d %H:%M')}] 新快照：{len(prices)} 項物品，{len(messages)} 則提醒")
+    store.set_meta("last_snapshot", str(ts))
+    snap = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    print(f"[快照 {snap}] {len(prices)} 項物品有掛單，{len(messages)} 則提醒")
     if messages:
         notify(cfg, f"📈 拍賣場價格波動（{cfg.region.upper()}）\n\n" + "\n\n".join(messages))
     return True
@@ -404,12 +413,12 @@ def run_once(cfg: Config, api: Blizzard, store: Store) -> bool:
 def list_prices(store: Store) -> None:
     rows = store.db.execute("""
         SELECT s.item_id, COALESCE(i.name, s.item_id), s.min_price, s.buy_price, s.quantity
-        FROM snapshot s LEFT JOIN item i USING (item_id)
-        WHERE s.ts = (SELECT MAX(ts) FROM snapshot) ORDER BY s.buy_price DESC""").fetchall()
+        FROM snapshot s JOIN item i USING (item_id)
+        WHERE s.ts = (SELECT MAX(ts) FROM snapshot) ORDER BY i.name""").fetchall()
     if not rows:
         print("還沒有資料，先跑一次 --once")
     for iid, name, mn, buy, qty in rows:
-        print(f"{iid:>7}  {name:<24} 最低 {fmt_gold(mn):>14}  均價 {fmt_gold(buy):>14}  庫存 {qty:>9,}")
+        print(f"{iid:>7}  {name:<16} 最低 {fmt_gold(mn):>14}  均價 {fmt_gold(buy):>14}  庫存 {qty:>9,}")
 
 
 def main() -> None:
@@ -429,11 +438,11 @@ def main() -> None:
     if args.test_notify:
         return notify(cfg, "✅ wow-ah-alert 測試訊息：通知設定正常")
 
-    api = Blizzard(cfg)
+    api = Undermine(cfg)
     if args.once:
         run_once(cfg, api, store)
         return
-    print(f"每 {cfg.poll_minutes} 分鐘檢查一次（Blizzard 大約每小時更新一次商品資料）。Ctrl+C 結束。")
+    print(f"每 {cfg.poll_minutes} 分鐘檢查一次（資料大約每小時更新）。Ctrl+C 結束。")
     while True:
         try:
             run_once(cfg, api, store)

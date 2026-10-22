@@ -1,24 +1,27 @@
 # 複製成 config.toml 再修改。
-# 金鑰也可以改用環境變數：BNET_CLIENT_ID / BNET_CLIENT_SECRET / DISCORD_WEBHOOK / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID
+# 金鑰也可以改用環境變數：UNDERMINE_API_KEY / DISCORD_WEBHOOK / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID
 
-[battlenet]
-# 到 https://develop.battle.net/access/clients 建立一個 client（免費）
-client_id = ""
-client_secret = ""
+[undermine]
+# 用 Patreon 登入 https://undermine.exchange/api.html 後，點「Click to reveal your key」
+# 免費帳號就能用，不用贊助
+api_key = ""
 region = "tw"
-# 只用來產生 undermine.exchange 的連結；商品價格全區相同
+# 只用來產生網站連結；商品價格全區相同
 realm_slug = "whisperwind"
+# 物品名稱語言：zh_TW / en_US / ko_KR / de_DE / fr_FR
 locale = "zh_TW"
 
 [watch]
-# undermine.exchange 網址的 cat=7.5 = 物品類別 7（商業技能）/ 子類別 5（布料）
+# undermine.exchange 網址的 cat=7.5 = 物品類別 7（材料）/ 子類別 5（布料）
 item_class = 7
 item_subclass = 5
+# 只追蹤這個資料片編號（含）以後的物品，例如 11 = 前一個資料片＋最新資料片。不填 = 自動只追最新資料片
+# min_expansion = 11
 # 另外想追蹤的物品 id（不在上面分類裡也可以）。只想追特定物品就把 item_class 那兩行刪掉
 item_ids = []
-# 用「買 N 個的平均單價」判斷波動，避免一筆特價掛單就誤報
+# 用「買 N 個的平均單價」判斷波動，避免一筆特價掛單就誤報。設成 1 = 只看最低價
 buy_quantity = 20
-# 多久檢查一次（分鐘）。Blizzard 約每小時更新，沒更新時不會重複下載
+# 多久檢查一次（分鐘）。資料約每小時更新，沒更新時只花 3 點額度
 poll_minutes = 10
 
 [alert]
@@ -41,6 +44,6 @@ telegram_chat_id = ""  # 先傳訊息給你的 bot，再開 https://api.telegram
 # 價格目標：最低價跌破 below 或漲破 above（單位：金）就提醒。可以寫很多組
 # 物品 id 就是 undermine.exchange 物品頁網址最後的數字
 # [[target]]
-# item_id = 123456
+# item_id = 237015
 # below = 30
 # above = 80
